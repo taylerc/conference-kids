@@ -179,6 +179,8 @@ canvas#cv{display:block;width:100%;touch-action:none}
 @keyframes bounce{0%{transform:scale(.3)}60%{transform:scale(1.15)}100%{transform:scale(1)}}
 #confetti{position:fixed;inset:0;z-index:31;pointer-events:none}
 #toast{position:fixed;left:50%;bottom:calc(24px + env(safe-area-inset-bottom));transform:translateX(-50%) translateY(120px);background:var(--ink);color:#fff;padding:12px 20px;border-radius:999px;font-size:18px;z-index:40;transition:transform .25s}
+#offline{position:fixed;left:50%;top:calc(8px + env(safe-area-inset-top));transform:translateX(-50%);background:#fff3c4;color:var(--ink);padding:8px 16px;border-radius:999px;font-size:15px;z-index:40;box-shadow:var(--shadow);display:none}
+#offline.show{display:block}
 #toast.show{transform:translateX(-50%) translateY(0)}
 
 @media (max-width:520px){
@@ -193,8 +195,12 @@ canvas#cv{display:block;width:100%;touch-action:none}
 <div id="celebrate" data-act="closeCelebrate"><div class="big" id="celBig">BINGO!</div><div class="sub" id="celSub"></div><div class="tap">Tap to keep playing</div></div>
 <canvas id="confetti"></canvas>
 <div id="toast"></div>
+<div id="offline">📡 Offline. Changes will sync when you’re back online.</div>
 
-<script>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
+import { getDatabase, ref, onValue, set, update, push, increment } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js";
+
 /* ============ Bingo square pools ============ */
 const WORDS = [
   {t:"Jesus Christ",e:"🌟"},{t:"Heavenly Father",e:"☀️"},{t:"Holy Ghost",e:"🕊️"},{t:"Faith",e:"🌱"},
@@ -258,38 +264,90 @@ const AVATARS = ["🦁","🐯","🐻","🐼","🐨","🦊","🐸","🐵","🦄",
 const COLORS = ["#ff6b6b","#ffa94d","#fcc419","#51cf66","#20c997","#339af0","#5c7cfa","#cc5de8","#f06595"];
 const DRAW_COLORS = ["#1f2544","#ef5b5b","#ff9f43","#fcc419","#2fbf71","#339af0","#8e5cf7","#f06595","#8d6e63","#ffffff"];
 
+/* ============ Firebase ============ */
+const firebaseConfig = {
+  apiKey: "AIzaSyBoil0gDhwSvmYA9EzclMUfR7Ig-LVYhsI",
+  authDomain: "conference-kids.firebaseapp.com",
+  databaseURL: "https://conference-kids-default-rtdb.firebaseio.com",
+  projectId: "conference-kids",
+  storageBucket: "conference-kids.firebasestorage.app",
+  messagingSenderId: "722354467522",
+  appId: "1:722354467522:web:ec4d2ed56d2c52721e015b"
+};
+const db = getDatabase(initializeApp(firebaseConfig));
+
 /* ============ State ============ */
-const STORE_KEY = 'conferenceKids.v1';
+// Family data lives in Firebase under families/<FID>. Anyone with the family link can open it.
+// Only "which family" and "which kid" are remembered on the device itself.
+const DEVICE_KEY = 'conferenceKids.device';
 const uid = () => Math.random().toString(36).slice(2,10) + Date.now().toString(36).slice(-4);
-const defaults = () => ({
-  kids: [], activeKid: null, cards: {}, notes: {}, history: [],
-  rewards: [
-    {id:uid(), name:'Pick a treat', cost:30},
-    {id:uid(), name:'Stay up 15 minutes late', cost:60},
-    {id:uid(), name:'Choose the family movie', cost:100}
-  ],
-  settings: {linePts:10, blackoutPts:50},
-  parentCode: null
-});
-function load(){
-  try{ const raw = localStorage.getItem(STORE_KEY); if(raw) return Object.assign(defaults(), JSON.parse(raw)); }catch(e){}
-  return defaults();
+const DEFAULT_REWARDS = [['Pick a treat',30],['Stay up 15 minutes late',60],['Choose the family movie',100]];
+const DEFAULT_SETTINGS = {linePts:10, blackoutPts:50};
+
+let device = {};
+try{ device = JSON.parse(localStorage.getItem(DEVICE_KEY)) || {}; }catch(e){}
+function saveDevice(){ try{ localStorage.setItem(DEVICE_KEY, JSON.stringify(device)); }catch(e){} }
+
+const params = new URLSearchParams(location.search);
+let FID = params.get('f') || device.fid || null;
+if(params.get('f')){ device.fid = params.get('f'); if(params.get('k')) device.activeKid = params.get('k'); saveDevice(); }
+
+let S = {kids:[], rewards:[], cards:{}, notes:{}, history:[], settings:{...DEFAULT_SETTINGS}, parentCode:null, get activeKid(){ return device.activeKid; }, set activeKid(v){ device.activeKid = v; saveDevice(); }};
+let V = {view: FID ? 'loading' : 'welcome'};   // view state, not saved
+
+const famRef = p => ref(db, `families/${FID}${p ? '/' + p : ''}`);
+const dbErr = e => { console.error(e); toast('Could not save. Check the internet connection.'); };
+const put = (p, v) => set(famRef(p), v).catch(dbErr);
+const patch = obj => update(famRef(), obj).catch(dbErr);
+
+function fromDB(f){
+  const list = o => Object.entries(o || {}).map(([id, v]) => ({...v, id}));
+  S.parentCode = f.parentCode || null;
+  S.settings = {...DEFAULT_SETTINGS, ...(f.settings || {})};
+  S.kids = list(f.kids).map(k => ({...k, points: k.points || 0})).sort((a,b) => (a.created||0) - (b.created||0));
+  S.rewards = list(f.rewards);
+  S.cards = f.cards || {};
+  S.notes = {};
+  for(const [kidId, o] of Object.entries(f.notes || {})) S.notes[kidId] = list(o).map(n => ({text:'', drawing:null, ...n}));
+  S.history = list(f.history).sort((a,b) => b.ts - a.ts);
 }
-let S = load();
-function save(){
-  try{ localStorage.setItem(STORE_KEY, JSON.stringify(S)); }
-  catch(e){ toast('Storage is full. Ask a parent to delete some drawings.'); }
+
+let unsubscribe = null;
+function connect(){
+  if(unsubscribe) unsubscribe();
+  unsubscribe = onValue(famRef(), snap => {
+    if(!snap.exists()){ V.view = 'notFound'; render(true); return; }
+    fromDB(snap.val());
+    if(V.view === 'loading') V.view = (device.activeKid && kid()) ? 'kid' : 'home';
+    softRender();
+  }, err => { console.error(err); V.view = 'notFound'; render(true); });
 }
-let V = {view:'home'};   // view state, not saved
+function familyLink(){ return `${location.origin}${location.pathname}?f=${FID}`; }
+function kidLink(k){ return `${familyLink()}&k=${k.id}`; }
+function newFamilyId(){
+  const a = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789', r = crypto.getRandomValues(new Uint8Array(22));
+  return [...r].map(x => a[x % a.length]).join('');
+}
+async function createFamily(codeHash){
+  FID = newFamilyId();
+  const rewards = {};
+  DEFAULT_REWARDS.forEach(([name, cost]) => rewards[uid()] = {name, cost});
+  await set(famRef(), {created:Date.now(), parentCode:codeHash, settings:DEFAULT_SETTINGS, rewards});
+  device = {fid: FID}; saveDevice();
+  history.replaceState(null, '', familyLink());
+  connect();
+}
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const rand = (a,b) => a + Math.floor(Math.random()*(b-a+1));
 const shuffle = a => { a=[...a]; for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];} return a; };
 const kid = () => S.kids.find(k => k.id === S.activeKid);
 const boardById = id => BOARDS.find(b => b.id === id);
-function addHistory(kidId, delta, reason){
-  S.history.unshift({kidId, delta, reason, ts:Date.now()});
-  if(S.history.length > 400) S.history.length = 400;
+function addPoints(k, delta, reason){
+  k.points += delta;
+  const h = {kidId:k.id, delta, reason, ts:Date.now()};
+  S.history.unshift(h);
+  patch({[`kids/${k.id}/points`]: increment(delta), [`history/${push(famRef('history')).key}`]: h});
 }
 function guessSession(){
   const d = new Date(), day = d.getDay(), h = d.getHours();
@@ -309,7 +367,7 @@ function newCard(board){
 }
 function getCard(kidId, boardId){
   S.cards[kidId] = S.cards[kidId] || {};
-  if(!S.cards[kidId][boardId]){ S.cards[kidId][boardId] = newCard(boardById(boardId)); save(); }
+  if(!S.cards[kidId][boardId]){ S.cards[kidId][boardId] = newCard(boardById(boardId)); put(`cards/${kidId}/${boardId}`, S.cards[kidId][boardId]); }
   return S.cards[kidId][boardId];
 }
 function lineSets(n){
@@ -336,25 +394,42 @@ function topBar(title, back){
     ${k ? `<div class="chip" style="--kc:${k.color}"><span class="e">${k.emoji}</span><b class="ptsLive">${k.points}</b>⭐</div>` : ''}
   </header>`;
 }
+const hero = sub => `<div class="hero"><div class="logo">🌟</div><h1>Conference Kids</h1><p>${sub}</p></div>`;
 
 const VIEWS = {
+  welcome(){
+    return `${hero('Bingo, notes and rewards for General Conference')}
+    <div class="card" style="max-width:520px;margin:20px auto 0;text-align:center">
+      <h2>Parents</h2>
+      <p class="muted" style="font-size:18px">Set up your family on your own phone or computer. You’ll get a link to send to each child’s tablet.</p>
+      <button class="btn" data-act="createFamilyStart">Create our family</button>
+    </div>
+    <p class="hint">Kids: ask a parent to send you your link.</p>`;
+  },
+  loading(){ return `${hero('Loading your family…')}`; },
+  notFound(){
+    return `${hero('We couldn’t find that family')}
+    <div class="card" style="max-width:520px;margin:20px auto 0;text-align:center">
+      <p class="muted" style="font-size:18px">The link may be incomplete, or the family was erased. Ask a parent for a fresh link.</p>
+      <button class="btn ghost" data-act="forgetFamily">Start over on this device</button>
+    </div>`;
+  },
+
   home(){
-    return `<div class="hero"><div class="logo">🌟</div><h1>Conference Kids</h1><p>Who's watching?</p></div>
-    <div class="kids">
+    return `${hero('Who’s watching?')}
+    ${S.kids.length ? `<div class="kids">
       ${S.kids.map(k => `<button class="kid-tile" style="--kc:${k.color}" data-act="pickKid" data-id="${k.id}">
         <span class="av">${k.emoji}</span><span class="nm">${esc(k.name)}</span><span class="pt">⭐ ${k.points}</span></button>`).join('')}
-      <button class="kid-tile add" data-act="newKid"><span class="av">＋</span><span class="nm">Add a kid</span></button>
-    </div>
-    <button class="parent-link" data-act="parent">⚙️ Parents</button>
-    ${S.parentCode ? '' : '<p class="hint" style="margin-top:4px;font-size:16px">Parents: tap ⚙️ to set a parent code before the kids start.</p>'}`;
+    </div>` : `<div class="empty"><span>👋</span>No kids yet. A parent can add them in ⚙️ Parents.</div>`}
+    <button class="parent-link" data-act="parent">⚙️ Parents</button>`;
   },
 
   editKid(){
     const d = V.draft;
-    return `${`<header class="top"><button class="back" data-act="go" data-to="${V.editBack||'home'}">‹</button><h1>${d.id ? 'Edit' : 'New'} player</h1></header>`}
+    return `<header class="top"><button class="back" data-act="go" data-to="parent">‹</button><h1>${d.id ? 'Edit' : 'New'} player</h1></header>
     <div class="card">
       <div class="label">Name</div>
-      <input class="inp" id="kidName" data-bind="name" maxlength="20" value="${esc(d.name)}" placeholder="Type a name" autocomplete="off">
+      <input class="inp" id="kidName" data-bind="name" maxlength="20" value="${esc(d.name)}" placeholder="First name" autocomplete="off">
       <div class="label">Pick an animal</div>
       <div class="pick">${AVATARS.map(a => `<button class="${a===d.emoji?'sel':''}" data-act="draftEmoji" data-v="${a}">${a}</button>`).join('')}</div>
       <div class="label">Pick a color</div>
@@ -377,7 +452,8 @@ const VIEWS = {
       <button class="menu-btn" style="background:var(--c2)" data-act="go" data-to="notes"><span>✏️</span>Notes<small>${(S.notes[k.id]||[]).length} notes</small></button>
       <button class="menu-btn" style="background:var(--c3)" data-act="go" data-to="rewards"><span>🎁</span>Rewards<small>${canGet ? canGet+' ready to get!' : 'Earn points!'}</small></button>
     </div>
-    ${next ? `<div class="hint">${next.cost - k.points} more points until <b>${esc(next.name)}</b></div>` : ''}`;
+    ${next ? `<div class="hint">${next.cost - k.points} more points until <b>${esc(next.name)}</b></div>` : ''}
+    ${S.kids.length > 1 ? `<h3 style="text-align:center;margin-top:30px">Family scoreboard</h3>${scoreboard()}` : ''}`;
   },
 
   boards(){
@@ -399,7 +475,7 @@ const VIEWS = {
       <div class="stat" id="cardStat">${statText(card)}</div></div>
     <div class="board-wrap"><div class="board s${b.size} ${b.big?'big':''}" style="grid-template-columns:repeat(${b.size},1fr);--kc:${k.color}">
       ${card.items.map((it,i) => `<button class="cell ${card.marked[i]?'on':''} ${it.free?'free':''} ${sc.win.has(i)?'win':''}" data-act="tap" data-i="${i}">
-        <span class="e">${it.e}</span>${b.big ? '' : `<span class="t">${esc(it.t)}</span>`}${b.big && !it.free ? `<span class="t">${esc(it.t)}</span>` : ''}
+        <span class="e">${it.e}</span>${it.free && b.big ? '' : `<span class="t">${esc(it.t)}</span>`}
         <span class="stamp">${it.free ? '' : k.emoji}</span></button>`).join('')}
     </div></div>
     <div class="bingo-foot"><button class="btn ghost" data-act="newCardAsk">🔄 New card</button></div>`;
@@ -459,7 +535,7 @@ const VIEWS = {
   parent(){
     const st = S.settings;
     const name = id => { const k = S.kids.find(x => x.id===id); return k ? k.emoji+' '+esc(k.name) : '(removed)'; };
-    return `<header class="top"><button class="back" data-act="leaveParent">‹</button><h1>⚙️ Parents</h1></header>
+    return `<header class="top"><button class="back" data-act="go" data-to="home">‹</button><h1>⚙️ Parents</h1></header>
     <div class="card"><h2>Kids & points</h2>
       ${S.kids.length ? S.kids.map(k => `<div class="prow"><span class="av">${k.emoji}</span><span class="nm">${esc(k.name)}</span>
         <span class="pts">${k.points}⭐</span>
@@ -467,8 +543,17 @@ const VIEWS = {
         <button class="btn ghost sm" data-act="adj" data-id="${k.id}" data-v="-1">−1</button>
         <button class="btn ghost sm" data-act="adj" data-id="${k.id}" data-v="1">+1</button>
         <button class="btn ghost sm" data-act="adj" data-id="${k.id}" data-v="10">+10</button>
-        <button class="btn ghost sm" data-act="editKid" data-id="${k.id}">✏️</button>
-        <button class="btn ghost sm" data-act="deleteKidAsk" data-id="${k.id}">🗑</button></div>`).join('') : '<p class="muted">No kids yet.</p>'}
+        <button class="btn ghost sm" data-act="editKid" data-id="${k.id}" aria-label="Edit">✏️</button>
+        <button class="btn ghost sm" data-act="deleteKidAsk" data-id="${k.id}" aria-label="Remove">🗑</button></div>`).join('') : '<p class="muted">No kids yet. Add each child, then send them their link.</p>'}
+      <div class="row" style="margin-top:12px"><button class="btn" data-act="newKid">＋ Add a kid</button></div>
+    </div>
+
+    <div class="card" style="margin-top:16px"><h2>Invite links</h2>
+      <p class="muted">Open a child’s link on their tablet and add it to the home screen. It goes straight to their board. Anyone with a link can open your family, so only send them to your kids.</p>
+      ${S.kids.map(k => `<div class="prow"><span class="av">${k.emoji}</span><span class="nm">${esc(k.name)}’s link</span>
+        <button class="btn sm" data-act="shareLink" data-id="${k.id}">🔗 Share</button></div>`).join('')}
+      <div class="prow"><span class="av">👨‍👩‍👧‍👦</span><span class="nm">Family link<br><small class="muted">For a shared tablet or another parent</small></span>
+        <button class="btn sm ghost" data-act="shareLink" data-id="">🔗 Share</button></div>
     </div>
 
     <div class="card" style="margin-top:16px"><h2>Rewards</h2>
@@ -486,7 +571,7 @@ const VIEWS = {
     </div>
 
     <div class="card" style="margin-top:16px"><h2>Parent code</h2>
-      <p class="muted">Needed for this screen and for giving out rewards. It is saved on this device only, so set one on each tablet.</p>
+      <p class="muted">One code for the whole family, on every device. Needed for this screen and for giving out rewards.</p>
       <button class="btn ghost" data-act="changeCode">🔒 Change code</button>
     </div>
 
@@ -494,7 +579,7 @@ const VIEWS = {
       <p class="muted">Start fresh for the next conference. Points can stay or be reset separately.</p>
       <div class="row"><button class="btn ghost" data-act="resetCardsAsk">🔄 New cards for everyone</button>
       <button class="btn ghost" data-act="resetPointsAsk">0️⃣ Reset all points</button>
-      <button class="btn danger" data-act="eraseAllAsk">Erase everything</button></div>
+      <button class="btn danger" data-act="eraseAllAsk">Erase family</button></div>
     </div>
 
     <div class="card" style="margin-top:16px"><h2>Recent activity</h2>
@@ -503,37 +588,49 @@ const VIEWS = {
   }
 };
 
+function scoreboard(){
+  return `<div class="card" style="max-width:520px;margin:0 auto">${[...S.kids].sort((a,b) => b.points-a.points).map(k =>
+    `<div class="prow"><span class="av">${k.emoji}</span><span class="nm">${esc(k.name)}</span><span class="pts">${k.points}⭐</span></div>`).join('')}</div>`;
+}
 function statText(card){ return `${card.lines} bingo${card.lines===1?'':'s'} · +${card.earned}⭐`; }
 function findNote(id){ const k = kid(); return k && (S.notes[k.id]||[]).find(n => n.id === id); }
 
 /* ============ Render ============ */
+const KID_VIEWS = ['kid','boards','bingo','notes','noteEdit','draw','rewards'];
 function render(scrollTop){
+  if(KID_VIEWS.includes(V.view) && !kid()) V.view = FID ? 'home' : 'welcome';
   document.getElementById('app').innerHTML = (VIEWS[V.view] || VIEWS.home)();
   if(V.view === 'draw') initCanvas();
   if(scrollTop) window.scrollTo(0,0);
 }
-function go(view, extra){ Object.assign(V, extra||{}, {view}); render(true); }
+// Called when data arrives from another device. Avoid wiping out typing, drawing or an open dialog.
+let pendingRender = false;
+function softRender(){
+  const k = kid();
+  document.querySelectorAll('.ptsLive').forEach(x => x.textContent = k ? k.points : '');
+  const a = document.activeElement, typing = a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA');
+  const busy = typing || ['noteEdit','draw','editKid'].includes(V.view) || document.getElementById('modal').classList.contains('show');
+  if(busy){ pendingRender = true; return; }
+  pendingRender = false; render();
+}
+function go(view, extra){ Object.assign(V, extra||{}, {view}); pendingRender = false; render(true); }
 
 /* ============ Modal / toast / celebrate ============ */
 function showModal(html){ document.getElementById('modalBox').innerHTML = html; document.getElementById('modal').classList.add('show'); }
-function closeModal(){ document.getElementById('modal').classList.remove('show'); V.modalCb = null; }
+function closeModal(){ document.getElementById('modal').classList.remove('show'); V.modalCb = null; if(pendingRender) softRender(); }
 function confirmBox(title, msg, yes, cb, danger){
   V.modalCb = cb;
   showModal(`<h2>${title}</h2><p>${msg}</p><div class="row end"><button class="btn ghost" data-act="closeModal">Cancel</button>
     <button class="btn ${danger?'danger':''}" data-act="modalYes">${yes}</button></div>`);
 }
-// Not real security (anyone with dev tools could reset it); it just keeps the code from sitting in storage as plain text.
+// Not real security (anyone with the family link and dev tools could change it); it keeps the code out of plain sight.
 function hashCode(str){
   let h = 0x811c9dc5;
   for(const ch of 'conference-kids:' + str){ h ^= ch.codePointAt(0); h = Math.imul(h, 0x01000193) >>> 0; }
   return h.toString(16);
 }
-function gate(cb, allowSetup){
-  if(!S.parentCode){
-    if(allowSetup) return setCode(cb);
-    return showModal(`<h2>🔒 No parent code yet</h2><p>Ask a parent to open <b>⚙️ Parents</b> on the home screen and set a code first.</p>
-      <div class="row end"><button class="btn" data-act="closeModal">OK</button></div>`);
-  }
+function gate(cb){
+  if(!S.parentCode) return cb();
   V.gateCb = cb;
   showModal(`<h2>🔒 Grown-ups only</h2><p>Enter the parent code.</p>
     <input id="gateIn" class="inp" type="password" autocomplete="off" autocapitalize="off" spellcheck="false">
@@ -544,7 +641,7 @@ function gate(cb, allowSetup){
 function setCode(cb){
   V.setCodeCb = cb;
   showModal(`<h2>🔒 ${S.parentCode ? 'Change' : 'Create'} parent code</h2>
-    <p>Pick a code or password the kids don\u2019t know (at least 4 characters). You\u2019ll need it for the Parents screen and to give out rewards.</p>
+    <p>Pick a code or password the kids don’t know (at least 4 characters). It works on every device in your family.</p>
     <div class="label">New code</div><input id="codeA" class="inp" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false">
     <div class="label">Type it again</div><input id="codeB" class="inp" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false">
     <p class="err" id="codeErr"></p>
@@ -609,19 +706,30 @@ function initCanvas(){
 }
 
 /* ============ Actions ============ */
+const notePath = (n, field) => `notes/${S.activeKid}/${n.id}${field ? '/' + field : ''}`;
+let textT;
 const A = {
   go: d => go(d.to),
-  newKid(){ V.draft = {name:'', emoji:AVATARS[rand(0,AVATARS.length-1)], color:COLORS[S.kids.length % COLORS.length]}; V.editBack = 'home'; go('editKid'); },
-  editKid(d){ const k = S.kids.find(x => x.id===d.id); V.draft = {...k}; V.editBack = 'parent'; go('editKid'); },
+  createFamilyStart(){ setCode(() => { go('parent'); toast('Family created! Now add your kids.'); }); },
+  forgetFamily(){ device = {}; saveDevice(); FID = null; if(unsubscribe) unsubscribe(); history.replaceState(null, '', location.pathname); go('welcome'); },
+
+  newKid(){ V.draft = {name:'', emoji:AVATARS[rand(0,AVATARS.length-1)], color:COLORS[S.kids.length % COLORS.length]}; go('editKid'); },
+  editKid(d){ const k = S.kids.find(x => x.id===d.id); V.draft = {...k}; go('editKid'); },
   draftEmoji(d){ V.draft.emoji = d.v; render(); },
   draftColor(d){ V.draft.color = d.v; render(); },
   saveKid(){
     const d = V.draft, name = (d.name||'').trim();
     if(!name){ document.getElementById('kidErr').textContent = 'Please type a name.'; return; }
-    if(d.id){ Object.assign(S.kids.find(x => x.id===d.id), {name, emoji:d.emoji, color:d.color}); save(); go(V.editBack); }
-    else { const k = {id:uid(), name, emoji:d.emoji, color:d.color, points:0}; S.kids.push(k); S.activeKid = k.id; save(); go('kid'); }
+    if(d.id){
+      Object.assign(S.kids.find(x => x.id===d.id), {name, emoji:d.emoji, color:d.color});
+      patch({[`kids/${d.id}/name`]:name, [`kids/${d.id}/emoji`]:d.emoji, [`kids/${d.id}/color`]:d.color});
+    } else {
+      const k = {id:uid(), name, emoji:d.emoji, color:d.color, points:0, created:Date.now()};
+      S.kids.push(k); put(`kids/${k.id}`, {name, emoji:k.emoji, color:k.color, points:0, created:k.created});
+    }
+    go('parent');
   },
-  pickKid(d){ S.activeKid = d.id; save(); go('kid'); },
+  pickKid(d){ S.activeKid = d.id; go('kid'); },
 
   openBoard(d){ go('bingo', {board:d.id}); },
   tap(d, el){
@@ -630,9 +738,9 @@ const A = {
     card.marked[i] = !card.marked[i];
     const sc = scoreCard(card, b.size), delta = sc.pts - card.earned;
     const newLines = sc.lines > card.lines, newBlack = sc.black && !card.black;
-    if(delta){ k.points += delta; addHistory(k.id, delta, delta > 0 ? `Bingo on ${b.name}` : `Unmarked a square on ${b.name}`); }
     Object.assign(card, {earned:sc.pts, lines:sc.lines, black:sc.black});
-    save();
+    put(`cards/${k.id}/${b.id}`, card);
+    if(delta) addPoints(k, delta, delta > 0 ? `Bingo on ${b.name}` : `Unmarked a square on ${b.name}`);
     el.classList.toggle('on', card.marked[i]);
     document.querySelectorAll('.cell').forEach((c,j) => c.classList.toggle('win', sc.win.has(j)));
     document.getElementById('cardStat').textContent = statText(card);
@@ -642,7 +750,7 @@ const A = {
   },
   newCardAsk(){
     confirmBox('New card?', 'You get a brand new card. Don’t worry, <b>your points stay!</b>', 'New card', () => {
-      const k = kid(); S.cards[k.id][V.board] = newCard(boardById(V.board)); save(); render(); toast('Fresh card. Good luck!');
+      const k = kid(), c = newCard(boardById(V.board)); S.cards[k.id][V.board] = c; put(`cards/${k.id}/${V.board}`, c); render(); toast('Fresh card. Good luck!');
     });
   },
   closeCelebrate(){ document.getElementById('celebrate').classList.remove('show'); },
@@ -651,15 +759,15 @@ const A = {
   newNote(){ const n = makeNote(); go('noteEdit', {noteId:n.id}); setTimeout(() => { const t = document.getElementById('noteText'); t && t.focus(); }, 80); },
   newDrawing(){ const n = makeNote(); V.noteId = n.id; go('draw'); },
   openNote(d){ go('noteEdit', {noteId:d.id}); },
-  noteSession(d){ findNote(V.noteId).session = d.v; save(); render(); },
+  noteSession(d){ const n = findNote(V.noteId); n.session = d.v; put(notePath(n,'session'), d.v); render(); },
   addPrompt(d){
     const t = document.getElementById('noteText'), n = findNote(V.noteId);
     n.text = (n.text && !n.text.endsWith('\n') ? n.text + '\n' : (n.text||'')) + d.v + ' ';
-    t.value = n.text; save(); t.focus(); t.setSelectionRange(t.value.length, t.value.length);
+    t.value = n.text; put(notePath(n,'text'), n.text); t.focus(); t.setSelectionRange(t.value.length, t.value.length);
   },
   deleteNoteAsk(){
     confirmBox('Delete this note?', 'It will be gone for good.', 'Delete', () => {
-      const k = kid(); S.notes[k.id] = S.notes[k.id].filter(n => n.id !== V.noteId); save(); go('notes');
+      const k = kid(), n = findNote(V.noteId); S.notes[k.id] = S.notes[k.id].filter(x => x.id !== n.id); put(notePath(n), null); go('notes');
     }, true);
   },
   penColor(d){ V.pen.color = d.v; document.querySelectorAll('.swatch').forEach(s => s.classList.toggle('sel', s.dataset.v===d.v)); },
@@ -669,62 +777,83 @@ const A = {
     ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
   },
   saveDrawing(){
-    const n = findNote(V.noteId); n.drawing = document.getElementById('cv').toDataURL('image/jpeg', .8); save(); go('noteEdit');
+    const n = findNote(V.noteId); n.drawing = document.getElementById('cv').toDataURL('image/jpeg', .8); put(notePath(n,'drawing'), n.drawing); go('noteEdit');
   },
 
   redeemAsk(d){
     const k = kid(), r = S.rewards.find(x => x.id===d.id);
     gate(() => confirmBox('Get this reward?', `<b>${esc(r.name)}</b> for ${r.cost} points.<br>${esc(k.name)} will have ${k.points - r.cost} left.`, 'Yes!', () => {
-      k.points -= r.cost; addHistory(k.id, -r.cost, `Reward: ${r.name}`); save(); render();
+      addPoints(k, -r.cost, `Reward: ${r.name}`); render();
       celebrate('🎁 Yay!', `Enjoy: ${r.name}`);
     }));
   },
 
-  parent(){ gate(() => go('parent'), true); },
+  parent(){ gate(() => go('parent')); },
   changeCode(){ setCode(() => toast('Parent code changed')); },
-  leaveParent(){ go('home'); },
-  adj(d){ const k = S.kids.find(x => x.id===d.id), v = +d.v; k.points += v; addHistory(k.id, v, 'Parent adjustment'); save(); render(); },
+  adj(d){ addPoints(S.kids.find(x => x.id===d.id), +d.v, 'Parent adjustment'); render(); },
+  async shareLink(d){
+    const k = d.id && S.kids.find(x => x.id===d.id), url = k ? kidLink(k) : familyLink();
+    const title = k ? `${k.name}’s Conference Kids link` : 'Our Conference Kids family';
+    if(navigator.share){ try{ await navigator.share({title, url}); return; }catch(e){ if(e.name === 'AbortError') return; } }
+    try{ await navigator.clipboard.writeText(url); toast('Link copied'); return; }catch(e){}
+    showModal(`<h2>${esc(title)}</h2><p>Copy this link:</p><input class="inp" style="font-size:15px" readonly value="${esc(url)}" onfocus="this.select()">
+      <div class="row end" style="margin-top:12px"><button class="btn" data-act="closeModal">Done</button></div>`);
+  },
   deleteKidAsk(d){
     const k = S.kids.find(x => x.id===d.id);
-    confirmBox(`Remove ${esc(k.name)}?`, 'Their points, cards and notes will be deleted.', 'Remove', () => {
+    confirmBox(`Remove ${esc(k.name)}?`, 'Their points, cards and notes will be deleted on every device.', 'Remove', () => {
       S.kids = S.kids.filter(x => x.id!==k.id); delete S.cards[k.id]; delete S.notes[k.id];
-      if(S.activeKid === k.id) S.activeKid = null; save(); render();
+      patch({[`kids/${k.id}`]:null, [`cards/${k.id}`]:null, [`notes/${k.id}`]:null});
+      if(S.activeKid === k.id) S.activeKid = null; render();
     }, true);
   },
   addReward(){
     const name = document.getElementById('rwName').value.trim(), cost = parseInt(document.getElementById('rwCost').value, 10);
     if(!name || !(cost > 0)){ toast('Type a reward name and a point cost.'); return; }
-    S.rewards.push({id:uid(), name, cost}); save(); render();
+    const id = uid(); S.rewards.push({id, name, cost}); put(`rewards/${id}`, {name, cost}); document.activeElement.blur(); render();
   },
-  deleteReward(d){ S.rewards = S.rewards.filter(r => r.id!==d.id); save(); render(); },
+  deleteReward(d){ S.rewards = S.rewards.filter(r => r.id!==d.id); put(`rewards/${d.id}`, null); render(); },
   saveSettings(){
     const l = parseInt(document.getElementById('setLine').value,10), b = parseInt(document.getElementById('setBlack').value,10);
     if(!(l >= 0) || !(b >= 0)){ toast('Use whole numbers.'); return; }
-    S.settings = {linePts:l, blackoutPts:b}; save(); toast('Saved'); render();
+    S.settings = {linePts:l, blackoutPts:b}; put('settings', S.settings); document.activeElement.blur(); toast('Saved'); render();
   },
-  resetCardsAsk(){ confirmBox('New cards for everyone?', 'All bingo cards start over. Points are kept.', 'Reset cards', () => { S.cards = {}; save(); render(); toast('All cards reset'); }); },
-  resetPointsAsk(){ confirmBox('Reset all points to 0?', 'This can’t be undone.', 'Reset points', () => { S.kids.forEach(k => { if(k.points) addHistory(k.id, -k.points, 'Points reset'); k.points = 0; }); save(); render(); }, true); },
-  eraseAllAsk(){ confirmBox('Erase everything?', 'Kids, points, cards, notes and rewards on this device will all be deleted.', 'Erase', () => { S = defaults(); save(); go('home'); }, true); },
+  resetCardsAsk(){ confirmBox('New cards for everyone?', 'All bingo cards start over. Points are kept.', 'Reset cards', () => { S.cards = {}; put('cards', null); render(); toast('All cards reset'); }); },
+  resetPointsAsk(){ confirmBox('Reset all points to 0?', 'This can’t be undone.', 'Reset points', () => {
+    const upd = {};
+    S.kids.forEach(k => { if(k.points){ upd[`history/${push(famRef('history')).key}`] = {kidId:k.id, delta:-k.points, reason:'Points reset', ts:Date.now()}; } upd[`kids/${k.id}/points`] = 0; k.points = 0; });
+    patch(upd); render();
+  }, true); },
+  eraseAllAsk(){ confirmBox('Erase the whole family?', 'Kids, points, cards, notes and rewards will be deleted on <b>every device</b>, and the links will stop working.', 'Erase', async () => {
+    if(unsubscribe){ unsubscribe(); unsubscribe = null; }
+    await set(famRef(), null).catch(dbErr);
+    A.forgetFamily();
+  }, true); },
 
   closeModal,
   modalYes(){ const cb = V.modalCb; closeModal(); cb && cb(); },
   gateCheck(){
     const v = document.getElementById('gateIn').value;
     if(hashCode(v) === S.parentCode){ const cb = V.gateCb; closeModal(); cb && cb(); }
-    else { document.getElementById('gateErr').textContent = 'That\u2019s not the code.'; document.getElementById('gateIn').select(); }
+    else { document.getElementById('gateErr').textContent = 'That’s not the code.'; document.getElementById('gateIn').select(); }
   },
-  saveCode(){
+  async saveCode(){
     const a = document.getElementById('codeA').value, b = document.getElementById('codeB').value, err = document.getElementById('codeErr');
     if(a.length < 4){ err.textContent = 'Use at least 4 characters.'; return; }
-    if(a !== b){ err.textContent = 'The two codes don\u2019t match.'; return; }
-    S.parentCode = hashCode(a); save();
-    const cb = V.setCodeCb; closeModal(); cb && cb();
+    if(a !== b){ err.textContent = 'The two codes don’t match.'; return; }
+    const cb = V.setCodeCb;
+    if(!FID){
+      err.textContent = 'Creating your family…';
+      try{ await createFamily(hashCode(a)); }catch(e){ console.error(e); FID = null; err.textContent = 'Could not reach the database. Check the internet and try again.'; return; }
+      S.parentCode = hashCode(a);
+    } else { S.parentCode = hashCode(a); put('parentCode', S.parentCode); }
+    closeModal(); cb && cb();
   }
 };
 function makeNote(){
   const k = kid(); S.notes[k.id] = S.notes[k.id] || [];
-  const n = {id:uid(), session: V.noteFilter && V.noteFilter!=='all' ? V.noteFilter : guessSession(), text:'', drawing:null, ts:Date.now()};
-  S.notes[k.id].push(n); save(); return n;
+  const n = {id:uid(), session: V.noteFilter && V.noteFilter!=='all' ? V.noteFilter : guessSession(), text:'', ts:Date.now()};
+  S.notes[k.id].push(n); put(notePath(n), {session:n.session, text:'', ts:n.ts}); return n;
 }
 
 /* ============ Events ============ */
@@ -737,8 +866,15 @@ document.getElementById('modal').addEventListener('click', e => { if(e.target.id
 document.addEventListener('input', e => {
   const b = e.target.dataset.bind; if(!b) return;
   if(b === 'name') V.draft.name = e.target.value;
-  if(b === 'noteText'){ const n = findNote(V.noteId); if(n){ n.text = e.target.value; n.ts = n.ts || Date.now(); save(); } }
+  if(b === 'noteText'){
+    const n = findNote(V.noteId); if(!n) return;
+    n.text = e.target.value; clearTimeout(textT); textT = setTimeout(() => put(notePath(n,'text'), n.text), 400);
+  }
 });
+document.addEventListener('focusout', () => setTimeout(() => {
+  const a = document.activeElement;
+  if(pendingRender && !(a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA')) && !['noteEdit','draw','editKid'].includes(V.view)) softRender();
+}, 50));
 document.addEventListener('keydown', e => {
   if(e.key !== 'Enter' || !document.getElementById('modal').classList.contains('show')) return;
   const id = document.activeElement && document.activeElement.id;
@@ -751,13 +887,27 @@ const _go = go;
 go = function(view, extra){
   if((V.view === 'noteEdit' || V.view === 'draw') && view === 'notes'){
     const k = kid(), n = findNote(V.noteId);
-    if(k && n && !n.text.trim() && !n.drawing){ S.notes[k.id] = S.notes[k.id].filter(x => x.id !== n.id); save(); }
+    if(k && n){
+      clearTimeout(textT);
+      if(!n.text.trim() && !n.drawing){ S.notes[k.id] = S.notes[k.id].filter(x => x.id !== n.id); put(notePath(n), null); }
+      else put(notePath(n,'text'), n.text);
+    }
   }
   _go(view, extra);
 };
 
-if(S.activeKid && !kid()) S.activeKid = null;
+// Small "offline" pill so a parent knows changes will sync later.
+let offlineT;
+onValue(ref(db, '.info/connected'), s => {
+  const el = document.getElementById('offline');
+  clearTimeout(offlineT);
+  if(s.val()) el.classList.remove('show');
+  else offlineT = setTimeout(() => el.classList.add('show'), 4000);
+});
+
+window.__ck = {S, V, A, get FID(){ return FID; }, go};
 render(true);
+if(FID) connect();
 </script>
 </body>
 </html>
