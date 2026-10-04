@@ -522,7 +522,10 @@ const VIEWS = {
       ${[3,6,14].map(s => `<button class="size ${V.pen.size===s?'sel':''}" data-act="penSize" data-v="${s}"><i style="width:${s+4}px;height:${s+4}px"></i></button>`).join('')}
     </div>
     <div class="canvas-wrap"><canvas id="cv"></canvas></div>
-    <div class="row" style="margin-top:14px"><button class="btn ghost" data-act="clearCanvas">🧽 Clear</button><span class="spacer"></span><button class="btn ok" data-act="saveDrawing">✓ Done</button></div>`;
+    <div class="row" style="margin-top:14px">
+      <button class="btn ghost" id="undoBtn" data-act="undoStroke" disabled>↶ Undo</button>
+      <button class="btn ghost" id="redoBtn" data-act="redoStroke" disabled>↷ Redo</button>
+      <button class="btn ghost" data-act="clearCanvas">🧽 Clear</button><span class="spacer"></span><button class="btn ok" data-act="saveDrawing">✓ Done</button></div>`;
   },
 
   rewards(){
@@ -691,6 +694,8 @@ function chime(){
 }
 
 /* ============ Drawing ============ */
+// Strokes are kept as a list (not canvas snapshots) so undo/redo stays light on tablet memory.
+// A {clear:true} entry wipes everything before it, including the saved drawing, and can be undone too.
 function initCanvas(){
   const n = findNote(V.noteId); if(!n) return;
   const c = document.getElementById('cv'), wrap = c.parentElement;
@@ -698,17 +703,44 @@ function initCanvas(){
   const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
   c.width = Math.round(w*dpr); c.height = Math.round(h*dpr); c.style.height = h+'px';
   const ctx = c.getContext('2d'); ctx.scale(dpr,dpr);
-  ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
   ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-  if(n.drawing){ const img = new Image(); img.onload = () => ctx.drawImage(img,0,0,w,h); img.src = n.drawing; }
-  V.canvasDims = {w,h};
-  let down = false, last = null;
+  V.canvas = {ctx, w, h, base:null, strokes:[], redo:[]};
+  redrawCanvas();
+  if(n.drawing){ const img = new Image(); img.onload = () => { V.canvas.base = img; redrawCanvas(); }; img.src = n.drawing; }
+  let cur = null;
   const pos = e => { const r = c.getBoundingClientRect(); return {x:e.clientX-r.left, y:e.clientY-r.top}; };
-  const stroke = (a,b) => { ctx.strokeStyle = V.pen.color; ctx.lineWidth = V.pen.color==='#ffffff' ? V.pen.size*3 : V.pen.size;
-    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); };
-  c.onpointerdown = e => { down = true; c.setPointerCapture(e.pointerId); last = pos(e); stroke(last, {x:last.x+.1, y:last.y+.1}); e.preventDefault(); };
-  c.onpointermove = e => { if(!down) return; const p = pos(e); stroke(last,p); last = p; };
-  c.onpointerup = c.onpointercancel = () => { down = false; };
+  c.onpointerdown = e => {
+    c.setPointerCapture(e.pointerId); e.preventDefault();
+    const p = pos(e);
+    cur = {color:V.pen.color, width:V.pen.color==='#ffffff' ? V.pen.size*3 : V.pen.size, pts:[p, {x:p.x+.1, y:p.y+.1}]};
+    V.canvas.strokes.push(cur); V.canvas.redo = [];
+    drawSegment(cur, 0); updateUndoButtons();
+  };
+  c.onpointermove = e => { if(!cur) return; cur.pts.push(pos(e)); drawSegment(cur, cur.pts.length - 2); };
+  c.onpointerup = c.onpointercancel = () => { cur = null; };
+}
+function drawSegment(st, i){
+  const ctx = V.canvas.ctx, a = st.pts[i], b = st.pts[i+1];
+  ctx.strokeStyle = st.color; ctx.lineWidth = st.width;
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+}
+function redrawCanvas(){
+  const {ctx, w, h, base, strokes} = V.canvas;
+  ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
+  let from = 0;
+  for(let i = strokes.length - 1; i >= 0; i--) if(strokes[i].clear){ from = i + 1; break; }
+  if(from === 0 && base) ctx.drawImage(base,0,0,w,h);
+  for(let i = from; i < strokes.length; i++){
+    const st = strokes[i];
+    ctx.strokeStyle = st.color; ctx.lineWidth = st.width; ctx.beginPath(); ctx.moveTo(st.pts[0].x, st.pts[0].y);
+    for(let j = 1; j < st.pts.length; j++) ctx.lineTo(st.pts[j].x, st.pts[j].y);
+    ctx.stroke();
+  }
+}
+function updateUndoButtons(){
+  const u = document.getElementById('undoBtn'), r = document.getElementById('redoBtn');
+  if(u) u.disabled = !V.canvas.strokes.length;
+  if(r) r.disabled = !V.canvas.redo.length;
 }
 
 /* ============ Actions ============ */
@@ -779,9 +811,12 @@ const A = {
   penColor(d){ V.pen.color = d.v; document.querySelectorAll('.swatch').forEach(s => s.classList.toggle('sel', s.dataset.v===d.v)); },
   penSize(d){ V.pen.size = +d.v; document.querySelectorAll('.size').forEach(s => s.classList.toggle('sel', s.dataset.v===d.v)); },
   clearCanvas(){
-    const c = document.getElementById('cv'), ctx = c.getContext('2d'), {w,h} = V.canvasDims;
-    ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
+    const cv = V.canvas, last = cv.strokes[cv.strokes.length - 1];
+    if(last && last.clear) return;
+    cv.strokes.push({clear:true}); cv.redo = []; redrawCanvas(); updateUndoButtons();
   },
+  undoStroke(){ const cv = V.canvas; if(!cv.strokes.length) return; cv.redo.push(cv.strokes.pop()); redrawCanvas(); updateUndoButtons(); },
+  redoStroke(){ const cv = V.canvas; if(!cv.redo.length) return; cv.strokes.push(cv.redo.pop()); redrawCanvas(); updateUndoButtons(); },
   saveDrawing(){
     const n = findNote(V.noteId); n.drawing = document.getElementById('cv').toDataURL('image/jpeg', .8); put(notePath(n,'drawing'), n.drawing); go('noteEdit');
   },
@@ -885,6 +920,7 @@ document.addEventListener('focusout', () => setTimeout(() => {
   if(pendingRender && !(a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA')) && !['noteEdit','draw','editKid'].includes(V.view)) softRender();
 }, 50));
 document.addEventListener('keydown', e => {
+  if(V.view === 'draw' && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z'){ e.preventDefault(); e.shiftKey ? A.redoStroke() : A.undoStroke(); return; }
   if(e.key !== 'Enter' || !document.getElementById('modal').classList.contains('show')) return;
   const id = document.activeElement && document.activeElement.id;
   if(id === 'gateIn') A.gateCheck();
